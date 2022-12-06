@@ -424,7 +424,7 @@ wildcard_write_template(State, Release, OverlayVars, FromFile0, ToFile0) ->
             write_template(OverlayVars, FromF, ToFile2)
     end, ok, FromFiles).
 
--spec write_template(proplists:proplist(), file:name(), file:name()) ->
+-spec write_template(proplists:proplist(), file:name(), {file | dir, file:name()}) ->
                             ok | relx:error().
 write_template(OverlayVars, FromFile, {Type, ToFile0}) ->
     case file:read_file(FromFile) of
