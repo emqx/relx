@@ -44,34 +44,63 @@ solve_release(Release, State0) ->
                         {false, [SystemLibs | LibDirs]}
                 end,
 
-            Pkgs = subset(Goals, AllApps, LibDirs1, CheckCodeLibDirs),
-            Pkgs1 = remove_exclude_apps(Pkgs, State1),
-            set_resolved(Release, Pkgs1, State1)
+            ExcludeApps = rlx_state:exclude_apps(State1),
+            Pkgs = subset(Goals, AllApps, LibDirs1, CheckCodeLibDirs, ExcludeApps),
+            set_resolved(Release, Pkgs, State1)
     end.
 
 %% find the app_info records for each application and its deps needed for the release
-subset(Apps, World, LibDirs, CheckCodeLibDirs) ->
-    subset(Apps, World, sets:new(), LibDirs, CheckCodeLibDirs, []).
+subset(Goals, World, LibDirs, CheckCodeLibDirs, ExcludeApps) ->
+    {Apps, _} = fold_apps(Goals, World, sets:new(), LibDirs, CheckCodeLibDirs, [], ExcludeApps),
+    Apps.
 
-subset([], _World, _Seen, _LibDirs, _CheckCodeLibDirs, Acc) ->
-    Acc;
-subset([Goal | Rest], World, Seen, LibDirs, CheckCodeLibDirs, Acc) ->
+subset(Goal, World, Seen, LibDirs, CheckCodeLibDirs, OptionalApplications, ExcludeApps) ->
     {Name, Vsn} = name_version(Goal),
     case sets:is_element(Name, Seen) of
         true ->
-            subset(Rest, World, Seen, LibDirs, CheckCodeLibDirs, Acc);
+            {[], Seen};
         _ ->
-            AppInfo=#{applications := Applications,
-                      included_applications := IncludedApplications} =
-                find_app(Name, Vsn, World, LibDirs, CheckCodeLibDirs),
-            subset(Rest ++ Applications ++ IncludedApplications,
-                   World,
-                   sets:add_element(Name, Seen),
-                   LibDirs,
-                   CheckCodeLibDirs,
-                   Acc ++ [AppInfo])
+            case find_app(Name, Vsn, World, LibDirs, CheckCodeLibDirs) of
+                not_found ->
+                    case lists:member(Name, OptionalApplications) of
+                        true ->
+                            %% don't add to Seen since optional applications are only
+                            %% per-application and not global, so another app could
+                            %% depend on this dependency
+                           {[], Seen};
+                        false ->
+                            erlang:error(?RLX_ERROR({app_not_found, Name, Vsn}))
+                    end;
+                AppInfo=#{applications := Applications,
+                          included_applications := IncludedApplications,
+                          optional_applications := OptionalApplications0} ->
+                    {Apps, Seen2} = fold_apps(Applications ++ IncludedApplications ++ OptionalApplications0,
+                                              World,
+                                              sets:add_element(Name, Seen),
+                                              LibDirs,
+                                              CheckCodeLibDirs,
+                                              OptionalApplications0,
+                                              ExcludeApps),
+
+                    %% don't add excluded apps
+                    %% TODO: should an excluded app's deps also be excluded?
+                    case lists:member(Name, ExcludeApps) of
+                        true ->
+                            {Apps, Seen2};
+                        false ->
+                            %% place the deps of the App before it
+                            {Apps ++ [AppInfo], Seen2}
+                    end
+            end
     end.
 
+fold_apps(Apps, World, Seen, LibDirs, CheckCodeLibDirs, OptionalApplications, ExcludeApps) ->
+    lists:foldl(fun(App, {AppAcc, SeenAcc}) ->
+                        {NewApps, SeenAcc1} = subset(App, World, SeenAcc, LibDirs,
+                                                     CheckCodeLibDirs, OptionalApplications, ExcludeApps),
+                        %% put new apps after the existing list to keep the user defined order
+                        {AppAcc ++ NewApps, SeenAcc1}
+                end, {[], Seen}, Apps).
 
 set_resolved(Release0, Pkgs, State) ->
     case rlx_release:realize(Release0, Pkgs) of
@@ -99,19 +128,6 @@ name_version(Name) when is_atom(Name) ->
     {Name, undefined};
 name_version({Name, #{vsn := Vsn}}) ->
     {Name, Vsn}.
-
-remove_exclude_apps(AllApps, State) ->
-    ExcludeApps = rlx_state:exclude_apps(State),
-    lists:foldl(fun(AppName, Acc) ->
-                        find_and_remove(AppName, Acc)
-                end, AllApps, ExcludeApps).
-
-find_and_remove(_, []) ->
-    [];
-find_and_remove(ExcludeName, [#{name := Name} | Rest]) when ExcludeName =:= Name ->
-    Rest;
-find_and_remove(ExcludeName, [H | Rest]) ->
-    [H | find_and_remove(ExcludeName, Rest)].
 
 %% Applications are first searched for in the `Apps' variable which is a map
 %% of application name to `rlx_app_info' map. This variable is passed to `relx'
@@ -144,7 +160,7 @@ search_for_app(Name, Vsn, LibDirs, CheckCodeLibDirs) ->
             %% app not found in any lib dir we are configured to search
             %% and user set a custom `system_libs' directory so we do
             %% not look in `code:lib_dir'
-            erlang:error(?RLX_ERROR({app_not_found, Name, Vsn}));
+            not_found;
         AppInfo ->
             case check_app(Name, Vsn, AppInfo) of
                 true ->
@@ -175,13 +191,13 @@ find_app_in_dir(Name, Vsn, [Dir | Rest]) ->
 find_app_in_code_path(Name, Vsn) ->
     case code:lib_dir(Name) of
         {error, bad_name} ->
-            erlang:error(?RLX_ERROR({app_not_found, Name, Vsn}));
+            not_found;
         Dir ->
             case to_app(Name, Vsn, filename:join([Dir, "ebin", [Name, ".app"]])) of
                 {true, AppInfo} ->
                     AppInfo;
                 false ->
-                    erlang:error(?RLX_ERROR({app_not_found, Name, Vsn}))
+                    not_found
             end
     end.
 
@@ -194,9 +210,13 @@ check_app(Name, Vsn, App) ->
         andalso rlx_app_info:vsn(App) =:= Vsn.
 
 to_app(Name, Vsn, AppFilePath) ->
-    {ok, [{application, _AppName, AppData}]} = file:consult(AppFilePath),
+    AppData = case file:consult(AppFilePath) of
+                  {ok, [{application, _Name, Data}]} -> Data;
+                  Other -> erlang:error(?RLX_ERROR({bad_app_file, AppFilePath, Other}))
+              end,
     Applications = proplists:get_value(applications, AppData, []),
     IncludedApplications = proplists:get_value(included_applications, AppData, []),
+    OptionalApplications = proplists:get_value(optional_applications, AppData, []),
 
     case lists:keyfind(vsn, 1, AppData) of
         {_, Vsn1} when Vsn =:= undefined ;
@@ -206,6 +226,7 @@ to_app(Name, Vsn, AppFilePath) ->
 
                      applications => Applications,
                      included_applications => IncludedApplications,
+                     optional_applications => OptionalApplications,
 
                      dir => filename:dirname(filename:dirname(AppFilePath)),
                      link => false}};

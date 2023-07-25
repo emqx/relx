@@ -39,7 +39,7 @@ do(Release, State) ->
                         end
                     end
                 ],
-            try beam_lib:strip_release(OutputDir) of
+            try beam_lib:strip_release(OutputDir,["Attr"]) of
                 {ok, _} ->
                     {ok, State1};
                 {error, _, Reason} ->
@@ -129,13 +129,20 @@ rewrite_app_file(State, App, TargetDir) ->
     Name = rlx_app_info:name(App),
     Applications = rlx_app_info:applications(App),
     IncludedApplications = rlx_app_info:included_applications(App),
+    OptionalApplications = rlx_app_info:optional_applications(App),
 
     %% TODO: should really read this in when creating rlx_app:t() and keep it
     AppFile = filename:join([TargetDir, "ebin", [Name, ".app"]]),
-    {ok, [{application, AppName, AppData0}]} = file:consult(AppFile),
+    ?log_debug("Rewriting .app file: ~s", [AppFile]),
+    [{application, AppName, AppData0}] = case file:consult(AppFile) of
+        {ok, AppTerms} ->
+            AppTerms;
+        {error, ConsultError} ->
+            erlang:error(?RLX_ERROR({consult_app_file, AppFile, ConsultError}))
+    end,
 
     %% maybe replace excluded apps
-    AppData1 = maybe_exclude_apps(Applications, IncludedApplications,
+    AppData1 = maybe_exclude_apps(Applications, IncludedApplications, OptionalApplications,
                                   AppData0, rlx_state:exclude_apps(State)),
 
     AppData2 = maybe_exclude_modules(AppData1, proplists:get_value(Name,
@@ -150,17 +157,23 @@ rewrite_app_file(State, App, TargetDir) ->
             erlang:error(?RLX_ERROR({rewrite_app_file, AppFile, Error}))
     end.
 
-maybe_exclude_apps(_Applications, _IncludedApplications, AppData, []) ->
+maybe_exclude_apps(_Applications, _IncludedApplications, _OptionalApplications, AppData, []) ->
     AppData;
-maybe_exclude_apps(Applications, IncludedApplications, AppData, ExcludeApps) ->
+maybe_exclude_apps(Applications, IncludedApplications, OptionalApplications, AppData, ExcludeApps) ->
     AppData1 = lists:keyreplace(applications,
                                 1,
                                 AppData,
                                 {applications, Applications -- ExcludeApps}),
-    lists:keyreplace(included_applications,
+    AppData2 = lists:keyreplace(included_applications,
+                                1,
+                                AppData1,
+                                {included_applications, IncludedApplications -- ExcludeApps}),
+
+    %% not absolutely necessary since they are already seen as optional, but may as well
+    lists:keyreplace(optional_applications,
                      1,
-                     AppData1,
-                     {included_applications, IncludedApplications -- ExcludeApps}).
+                     AppData2,
+                     {optional_applications, OptionalApplications -- ExcludeApps}).
 
 maybe_exclude_modules(AppData, []) ->
     AppData;
@@ -610,7 +623,7 @@ copy_or_symlink_config_file(State, ConfigPath, RelConfPath) ->
                 ok ->
                     ok;
                 {error, Reason} ->
-                    erlang:error({error, {rlx_file_utils, Reason}})
+                    erlang:error(?RLX_ERROR({unable_to_make_symlink, ConfigPath, RelConfPath, Reason}))
             end;
         _ ->
             case rlx_file_utils:copy(ConfigPath, RelConfPath, [{file_info, [mode, time]}]) of
@@ -650,22 +663,31 @@ include_erts(State, Release, OutputDir, RelDir) ->
                     ok = rlx_file_utils:copy(ErtsBinDir, LocalErtsBin,
                                              [recursive, {file_info, [mode, time]}]),
 
-                    case OsFamily of
+                    Result = case OsFamily of
                         unix ->
                             DynErl = filename:join([LocalErtsBin, "dyn_erl"]),
                             Erl = filename:join([LocalErtsBin, "erl"]),
-                            rlx_file_utils:copy(DynErl, Erl);
+                            case filelib:is_regular(DynErl) of
+                                true ->
+                                    ok = rlx_file_utils:ensure_writable(Erl),
+                                    rlx_file_utils:copy(DynErl, Erl);
+                                false ->
+                                    ok
+                            end;
                         win32 ->
-                            DynErl = filename:join([LocalErtsBin, "dyn_erl.ini"]),
-                            Erl = filename:join([LocalErtsBin, "erl.ini"]),
-                            rlx_file_utils:copy(DynErl, Erl)
+                            ok
                     end,
 
-                    %% drop yielding_c_fun binary if it exists
-                    %% it is large (1.1MB) and only used at compile time
-                    _ = rlx_file_utils:remove(filename:join([LocalErtsBin, "yielding_c_fun"])),
+                    case Result of
+                        ok ->
+                            %% drop yielding_c_fun binary if it exists
+                            %% it is large (1.1MB) and only used at compile time
+                            _ = rlx_file_utils:remove(filename:join([LocalErtsBin, "yielding_c_fun"])),
 
-                    make_boot_script(State, Release, OutputDir, RelDir)
+                            make_boot_script(State, Release, OutputDir, RelDir);
+                        {error, Reason}->
+                            erlang:error({error, {rlx_file_utils, Reason}})
+                    end
             end
     end.
 
@@ -734,8 +756,10 @@ maybe_check_for_undefined_functions_(State, Release) ->
             %% release
             case xref:analyze(Rf, undefined_function_calls) of
                 {ok, Warnings} ->
-                    format_xref_warning(Warnings);
-                {error, _} = Error ->
+                    FilterMethod = rlx_state:filter_xref_warning(State),
+                    FilteredWarnings = FilterMethod(Warnings),
+                    format_xref_warning(FilteredWarnings);
+                {error, _, _} = Error ->
                     ?log_warn(
                         "Error running xref analyze: ~s", 
                         [xref:format_error(Error)])
@@ -752,13 +776,13 @@ add_project_apps_to_xref(Rf, [AppSpec | Rest], State) ->
     case maps:find(element(1, AppSpec), rlx_state:available_apps(State)) of
         {ok, App=#{app_type := project}} ->
             case xref:add_application(
-                    Rf,
-                    rlx_app_info:dir(App),
-                    [{name, rlx_app_info:name(App)}, {warnings, false}]) 
+                   Rf,
+                   binary_to_list(rlx_app_info:dir(App)),
+                   [{name, rlx_app_info:name(App)}, {warnings, false}])
             of
                 {ok, _} ->
                     ok;
-                {error, _} = Error ->
+                {error, _, _} = Error ->
                     ?log_warn("Error adding application ~s to xref context: ~s",
                               [rlx_app_info:name(App), xref:format_error(Error)])
             end;
@@ -827,7 +851,7 @@ copy_to_start(RelDir, Name) ->
         ok ->
             ok;
         {error, Reason} ->
-            %% it isn't absolutely necesary for start.boot to exist so just warn
+            %% it isn't absolutely necessary for start.boot to exist so just warn
             ?log_warn("Unable to copy boot file ~s to start.boot: ~p", [BootFile, Reason]),
             ok
     end.
@@ -1069,9 +1093,9 @@ format_error({unable_to_create_output_dir, OutputDir}) ->
                   [OutputDir]);
 format_error({release_script_generation_error, Module, Errors}) ->
     ["Error generating release: \n", Module:format_error(Errors)];
-format_error({unable_to_make_symlink, AppDir, TargetDir, Reason}) ->
-    io_lib:format("Unable to symlink directory ~s to ~s because \n~s~s",
-                  [AppDir, TargetDir, rlx_util:indent(2),
+format_error({unable_to_make_symlink, Path, TargetPath, Reason}) ->
+    io_lib:format("Unable to symlink ~s to ~s because \n~s~s",
+                  [Path, TargetPath, rlx_util:indent(2),
                    file:format_error(Reason)]);
 format_error({boot_script_generation_error, Name}) ->
     io_lib:format("Unknown internal release error generating ~s.boot", [Name]);
@@ -1084,5 +1108,11 @@ format_error({strip_release, Reason}) ->
 format_error({rewrite_app_file, AppFile, Error}) ->
     io_lib:format("Unable to rewrite .app file ~s due to ~p",
                   [AppFile, Error]);
+format_error({consult_app_file, AppFile, enoent}) ->
+    io_lib:format("Unable to consult .app file ~ts (file not found).",
+                  [AppFile]);
+format_error({consult_app_file, AppFile, Error}) ->
+    io_lib:format("Unable to consult .app file ~ts due to ~ts",
+                  [AppFile, file:format_error(Error)]);
 format_error({create_RELEASES, Reason}) ->
     io_lib:format("Unable to create RELEASES file needed by release_handler: ~p", [Reason]).

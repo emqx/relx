@@ -19,7 +19,7 @@ fi
 
 # OSX does not support readlink '-f' flag, work
 # around that
-# shellcheck disable=SC2039
+# shellcheck disable=SC2039,SC3000-SC4000
 case $OSTYPE in
     darwin*)
         SCRIPT=$(readlink "$0" || true)
@@ -208,8 +208,8 @@ find_erts_dir() {
             __erts_version="$("$__erl" -boot no_dot_erlang -sasl errlog_type error -noshell -eval "$erts_version_code")"
             ERTS_DIR="${__erl_root}/erts-${__erts_version}"
             if [ -d "$ERTS_DIR" ]; then
-                ERTS_VSN=${__erts_version}
                 echo "Exact ERTS version (${ERTS_VSN}) match not found, instead using ${__erts_version}. The release may fail to run." 1>&2
+                ERTS_VSN=${__erts_version}
             else
                 echo "Can not run the release. There is no ERTS bundled with the release or found on the system."
                 exit 1
@@ -259,24 +259,24 @@ relx_get_nodename() {
     id="longname$(relx_gen_id)-${NAME}"
     if [ -z "$COOKIE" ]; then
         # shellcheck disable=SC2086
-        "$BINDIR/erl" -boot "$REL_DIR"/start_clean \
-                      -mode interactive \
-                      -boot_var SYSTEM_LIB_DIR "$SYSTEM_LIB_DIR" \
-                      -eval '[_,H]=re:split(atom_to_list(node()),"@",[unicode,{return,list}]), io:format("~s~n",[H]), halt()' \
-                      -dist_listen false \
-                      ${START_EPMD} \
-                      -noshell "${NAME_TYPE}" "$id"
+        "$BINDIR/erlexec" -boot "$REL_DIR"/start_clean \
+                          -mode interactive \
+                          -boot_var SYSTEM_LIB_DIR "$SYSTEM_LIB_DIR" \
+                          -eval '[_,H]=re:split(atom_to_list(node()),"@",[unicode,{return,list}]), io:format("~s~n",[H]), halt()' \
+                          -dist_listen false \
+                          ${START_EPMD} \
+                          -noshell "${NAME_TYPE}" "$id"
     else
         # running with setcookie prevents a ~/.erlang.cookie from being created
         # shellcheck disable=SC2086
-        "$BINDIR/erl" -boot "$REL_DIR"/start_clean \
-                      -mode interactive \
-                      -boot_var SYSTEM_LIB_DIR "$SYSTEM_LIB_DIR" \
-                      -eval '[_,H]=re:split(atom_to_list(node()),"@",[unicode,{return,list}]), io:format("~s~n",[H]), halt()' \
-                      -setcookie "${COOKIE}" \
-                      -dist_listen false \
-                      ${START_EPMD} \
-                      -noshell "${NAME_TYPE}" "$id"
+        "$BINDIR/erlexec" -boot "$REL_DIR"/start_clean \
+                          -mode interactive \
+                          -boot_var SYSTEM_LIB_DIR "$SYSTEM_LIB_DIR" \
+                          -eval '[_,H]=re:split(atom_to_list(node()),"@",[unicode,{return,list}]), io:format("~s~n",[H]), halt()' \
+                          -setcookie "${COOKIE}" \
+                          -dist_listen false \
+                          ${START_EPMD} \
+                          -noshell "${NAME_TYPE}" "$id"
     fi
 }
 
@@ -305,7 +305,7 @@ relx_rem_sh() {
     # -dist_listen is new in OTP-23. It keeps the remote node from binding to a listen port
     # and implies the option -hidden
     # shellcheck disable=SC2086
-    exec "$BINDIR/erl" ${remote_nodename} -remsh "$NAME" -boot "$REL_DIR"/start_clean -mode interactive \
+    exec "$BINDIR/erlexec" ${remote_nodename} -remsh "$NAME" -boot "$REL_DIR"/start_clean -mode interactive \
          -boot_var SYSTEM_LIB_DIR "$SYSTEM_LIB_DIR" \
          -setcookie "$COOKIE" -hidden -kernel net_ticktime "$TICKTIME" \
          -dist_listen false \
@@ -328,8 +328,8 @@ erl_rpc() {
                 DYNAMIC_NAME="-r"
             fi
 
-            if [ "$ERL_DIST_PORT" ]; then
-                result=$("$ERL_RPC" "${DYNAMIC_NAME}" -c "${COOKIE}" -address "${ERL_DIST_PORT}"  -timeout "${RELX_RPC_TIMEOUT}" -a "${command}")
+            if [ "$ADDRESS" ]; then
+                result=$("$ERL_RPC" "${DYNAMIC_NAME}" -c "${COOKIE}" -address "${ADDRESS}" -timeout "${RELX_RPC_TIMEOUT}" -a "${command}")
             else
                 result=$("$ERL_RPC" "$NAME_TYPE" "$NAME" "${DYNAMIC_NAME}" -c "${COOKIE}" -timeout "${RELX_RPC_TIMEOUT}" -a "${command}")
             fi
@@ -351,7 +351,11 @@ erl_eval() {
         *)
             command=$*
 
-            result=$(echo "${command}" | "$ERL_RPC" "$NAME_TYPE" "$NAME" -R -timeout "${RELX_RPC_TIMEOUT}" -c "${COOKIE}" -e)
+            if [ "$ERL_DIST_PORT" ]; then
+                result=$(echo "${command}" | "$ERL_RPC" "${DYNAMIC_NAME}" -c "${COOKIE}" -address "${ADDRESS}" -timeout "${RELX_RPC_TIMEOUT}" -e)
+            else
+                result=$(echo "${command}" | "$ERL_RPC" "$NAME_TYPE" "$NAME" "${DYNAMIC_NAME}" -c "${COOKIE}" -timeout "${RELX_RPC_TIMEOUT}" -e)
+            fi
             code=$?
             if [ $code -eq 0 ]; then
                 echo "$result" | sed 's/^{ok, \(.*\)}$/\1/'
@@ -365,7 +369,14 @@ erl_eval() {
 
 # Generate a random id
 relx_gen_id() {
-    dd count=1 bs=4 if=/dev/urandom 2> /dev/null | od -x  | head -n1 | awk '{print $2$3}'
+    # To prevent exhaustion of atoms on target node, optionally avoid
+    # generation of random node prefixes, if it is guaranteed calls
+    # are entirely sequential.
+    if [ -z "${NODETOOL_NODE_PREFIX}" ]; then
+        dd count=1 bs=4 if=/dev/urandom 2> /dev/null | od -x  | head -n1 | awk '{print $2$3}'
+    else
+        echo "${NODETOOL_NODE_PREFIX}"
+    fi
 }
 
 # Control a node with nodetool if erl_call isn't from OTP-23+
@@ -377,14 +388,14 @@ relx_nodetool() {
     nodetool_id="maint$(relx_gen_id)-${NAME}"
 
     if [ -z "${START_EPMD}" ]; then
-        ERL_FLAGS="${ERL_FLAGS} ${DIST_ARGS} ${EXTRA_DIST_ARGS} ${NAME_TYPE} $nodetool_id -setcookie ${COOKIE}" \
+        ERL_FLAGS="${ERL_FLAGS} ${DIST_ARGS} ${EXTRA_DIST_ARGS} ${NAME_TYPE} $nodetool_id -setcookie ${COOKIE} -dist_listen false" \
                  "$ERTS_DIR/bin/escript" \
                  "$ROOTDIR/bin/nodetool" \
                  "$NAME_TYPE" "$NAME" \
                  "$command" "$@"
     else
         # shellcheck disable=SC2086
-        ERL_FLAGS="${ERL_FLAGS} ${DIST_ARGS} ${EXTRA_DIST_ARGS} ${NAME_TYPE} $nodetool_id -setcookie ${COOKIE}" \
+        ERL_FLAGS="${ERL_FLAGS} ${DIST_ARGS} ${EXTRA_DIST_ARGS} ${NAME_TYPE} $nodetool_id -setcookie ${COOKIE} -dist_listen false" \
                  "$ERTS_DIR/bin/escript" \
                  "$ROOTDIR/bin/nodetool" \
                  $START_EPMD "$NAME_TYPE" "$NAME" "$command" "$@"
@@ -397,6 +408,22 @@ relx_escript() {
     export RELEASE_ROOT_DIR
 
     "$ERTS_DIR/bin/escript" "$ROOTDIR/$scriptpath" "$@"
+}
+
+# Convert {127,0,0,1} to 127.0.0.1 (inet:ntoa/1)
+addr_tuple_to_str() {
+    addr="$1"
+    saved_IFS="$IFS"
+    IFS="{,}'\" "
+    # shellcheck disable=SC2086
+    eval set -- $addr
+    IFS="$saved_IFS"
+
+    case $# in
+    4) printf '%u.%u.%u.%u' "$@";;
+    8) printf '%.4x:%.4x:%.4x:%.4x:%.4x:%.4x:%.4x:%.4x' "$@";;
+    *) echo "Cannot parse IP address tuple: '$addr'" 1>&2;;
+    esac
 }
 
 make_out_file_path() {
@@ -424,6 +451,7 @@ replace_os_vars() {
             slen=split(var,arr,":-")
             v=arr[1]
             e=ENVIRON[v]
+            gsub("&","\\\\\\&",e)
             if(slen > 1 && e=="") {
                 i=index(var, ":-"arr[2])
                 def=substr(var,i+2)
@@ -585,14 +613,20 @@ RELX_CONFIG_PATH=$(check_replace_os_vars sys.config "$RELX_CONFIG_PATH")
 #    - nonexisting -args_files
 #    - circular dependencies of -args_files
 #    - relative paths in -args_file parameters
-#    - multiple/mixed occurences of -name and -sname parameters
+#    - multiple/mixed occurrences of -name and -sname parameters
 #    - missing -name or -sname parameters
 # If all checks pass, extract the target node name
 set +e
-TMP_NAME_ARG=$(awk 'function check_name(file)
+TMP_NAME_ARG=$(awk 'function shell_quote(str)
+{
+    gsub(/'\''/,"'\'\\\\\'\''", str);
+    return "'\''" str "'\''"
+}
+
+function check_name(file)
 {
     # if file exists, then it should be readable
-    if (system("test -f "file) == 0 && system("test -r "file) != 0) {
+    if (system("test -f " shell_quote(file)) == 0 && system("test -r " shell_quote(file)) != 0) {
         print file" not readable"
         exit 3
     }
@@ -662,8 +696,17 @@ EPMD_MODULE="$(grep '^-epmd_module' "$VMARGS_PATH" || true)"
 if [ "$EPMD_MODULE" ]; then
     DIST_ARGS="${DIST_ARGS} ${EPMD_MODULE}"
 fi
+INET_DIST_USE_INTERFACE="$(grep '^-kernel  *inet_dist_use_interface' "$VMARGS_PATH" || true)"
+if [ "$INET_DIST_USE_INTERFACE" ]; then
+    DIST_ARGS="${DIST_ARGS} ${INET_DIST_USE_INTERFACE}"
+fi
 
 if [ "$ERL_DIST_PORT" ]; then
+    if [ "$INET_DIST_USE_INTERFACE" ]; then
+        ADDRESS="$(addr_tuple_to_str "${INET_DIST_USE_INTERFACE#*inet_dist_use_interface }"):$ERL_DIST_PORT"
+    else
+        ADDRESS="$ERL_DIST_PORT"
+    fi
     if [  "11.1" = "$(printf "%s\n11.1" "${ERTS_VSN}" | sort -V | head -n1)" ] ; then
         # unless set by the user, set start_epmd to false when ERL_DIST_PORT is used
         if [ ! "$START_EPMD" ]; then
@@ -672,8 +715,20 @@ if [ "$ERL_DIST_PORT" ]; then
             EXTRA_DIST_ARGS="-erl_epmd_port ${ERL_DIST_PORT}"
         fi
     else
+        ERL_DIST_PORT_WARNING="ERL_DIST_PORT is set and used to set the port, but doing so on ERTS version ${ERTS_VSN} means remsh/rpc will not work for this release"
+        if ! command -v logger > /dev/null 2>&1
+        then
+            echo "WARNING: ${ERL_DIST_PORT_WARNING}"
+        else
+            logger -p warning -t "${REL_NAME}[$$]" "${ERL_DIST_PORT_WARNING}"
+        fi
         EXTRA_DIST_ARGS="-kernel inet_dist_listen_min ${ERL_DIST_PORT} -kernel inet_dist_listen_max ${ERL_DIST_PORT}"
     fi
+fi
+
+# Force use of nodetool if proto_dist set as erl_call doesn't support proto_dist
+if [ "$PROTO_DIST" ]; then
+    ERL_RPC=relx_nodetool
 fi
 
 # Extract the target cookie
@@ -942,7 +997,12 @@ case "$1" in
 
         # Log the startup
         echo "$RELEASE_ROOT_DIR"
-        logger -t "${REL_NAME}[$$]" "Starting up"
+        if ! command -v logger > /dev/null 2>&1
+        then
+            echo "${REL_NAME}[$$] Starting up"
+        else
+            logger -t "${REL_NAME}[$$]" "Starting up"
+        fi
 
         relx_run_hooks "$PRE_START_HOOKS"
         # Start the VM
