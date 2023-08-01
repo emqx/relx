@@ -7,9 +7,10 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("kernel/include/file.hrl").
+-include_lib("stdlib/include/zip.hrl").
 
 all() ->
-    [basic_tar, exclude_erts, exclude_src, include_src, overlay_archive].
+    [basic_tar, exclude_erts, exclude_src, include_src, overlay_archive, tar_hooks].
 
 init_per_suite(Config) ->
     DataDir = filename:join(proplists:get_value(data_dir, Config), ?MODULE),
@@ -263,3 +264,32 @@ overlay_archive(Config) ->
     ?assert(lists:any(fun(X) -> re:run(X, "lib/stdlib-.*/ebin/.*") =/= nomatch end, Files)),
     ?assert(lists:any(fun(X) -> re:run(X, "lib/kernel-.*/ebin/.*") =/= nomatch end, Files)),
     ?assert(filelib:is_regular(TarFile)).
+
+tar_hooks(Config) ->
+    LibDir = proplists:get_value(lib_dir, Config),
+    OutputDir = ?config(out_dir, Config),
+    %% use tar hooks to kill one file and zip up the rest
+    TestHook1 = #{command => "hook1.sh", content => <<"#!/bin/bash\nfind \"${RELX_TEMP_DIR}\" -name foo.txt -exec rm {} \\; \n">>},
+    TestHook2 = #{command => "hook2.sh", content => <<"#!/bin/bash\ncd \"${RELX_TEMP_DIR}\"\nzip -r \"${RELX_OUTPUT_DIR}/${RELX_RELEASE_NAME}-${RELX_RELEASE_VSN}.zip\" .\n">>},
+    lists:foreach(fun(Hook) ->
+                          TestHookFile = maps:get(command, Hook),
+                          ok = file:write_file(TestHookFile, maps:get(content, Hook)),
+                          {ok, FileInfo} = file:read_file_info(TestHookFile),
+                          NewFileInfo = FileInfo#file_info{mode = 8#0755},
+                          ok = file:write_file_info(TestHookFile, NewFileInfo)
+                  end, [TestHook1, TestHook2]),
+    {ok, Cwd} = file:get_cwd(),
+    Hooks = [filename:join(Cwd, maps:get(command, Hook)) || Hook <- [TestHook1, TestHook2]],
+    RelxConfig = [{tar_hooks, Hooks},
+                  {release, {foo, "0.0.1"},
+                   [goal_app_1,
+                    goal_app_2]}],
+
+    {ok, _} = relx:build_tar(foo, [{root_dir, LibDir}, {lib_dirs, [LibDir]},
+                                   {output_dir, OutputDir} | RelxConfig]),
+
+    ZipFile = filename:join([OutputDir, "foo", "foo-0.0.1.zip"]),
+    {ok, Files} = zip:table(ZipFile),
+    ?assert(lists:any(fun(#zip_file{name = "releases/foo.rel"}) -> true; (_) -> false end, Files)),
+    ?assertNot(lists:any(fun(#zip_file{name = "lib/non_goal_1-0.0.1/priv/subdir/foo.txt"}) -> true; (_) -> false end, Files)).
+
