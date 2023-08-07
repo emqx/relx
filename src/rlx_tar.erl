@@ -19,7 +19,8 @@ make_tar(Release, OutputDir, State) ->
         Result when Result =:= ok orelse (is_tuple(Result) andalso
                                           element(1, Result) =:= ok) ->
             maybe_print_warnings(Result),
-            {ok, State1} = maybe_update_tar(TarFile, Release, ExtraFiles, OutputDir, State),
+            TarHooks = rlx_state:tar_hooks(State),
+            {ok, State1} = maybe_update_tar(TarFile, Release, ExtraFiles, TarHooks, OutputDir, State),
             ?log_info("Tarball successfully created: ~s",
                       [rlx_file_utils:print_path(TarFile)]),
             {ok, State1};
@@ -128,28 +129,22 @@ extra_files(Release, OutputDir, State) ->
                    []
            end].
 
-maybe_update_tar(TarFile, Release, ExtraFiles, OutputDir, State) ->
-    IsRelxSasl = rlx_state:is_relx_sasl(State),
-    TarHooks = rlx_state:tar_hooks(State),
-    case {IsRelxSasl, TarHooks} of
-        {true, []} ->
-            %% we used extra_files to copy in the overlays
-            %% nothing to do now but rename the tarball to <relname>-<vsn>.tar.gz
-            Name = rlx_release:name(Release),
-            file:rename(filename:join(OutputDir, [Name, ".tar.gz"]), TarFile),
-            {ok, State};
-        {true, [_|_]} ->
-            update_tar(TarFile, Release, [], OutputDir, State);
-        {false, [_|_]} ->
-            update_tar(TarFile, Release, ExtraFiles, OutputDir, State)
-    end.
+maybe_update_tar(TarFile, Release, _ExtraFiles, [], OutputDir, State) ->
+    %% no tar hooks
+    %% we used extra_files to copy in the overlays
+    %% nothing to do now but rename the tarball to <relname>-<vsn>.tar.gz
+    Name = rlx_release:name(Release),
+    file:rename(filename:join(OutputDir, [Name, ".tar.gz"]), TarFile),
+    {ok, State};
+maybe_update_tar(TarFile, Release, ExtraFiles, TarHooks, OutputDir, State) ->
+    update_tar(TarFile, Release, ExtraFiles, TarHooks, OutputDir, State).
 
 %% unpack the tarball to a temporary directory and repackage it with
 %% the overlays and other files we need to complete the target system
-update_tar(TarFile, Release, ExtraFiles, OutputDir, State) ->
+update_tar(TarFile, Release, ExtraFiles, TarHooks, OutputDir, State) ->
     TempDir = rlx_file_utils:mkdtemp(),
     try
-        update_tar(TarFile, Release, ExtraFiles, OutputDir, TempDir, State)
+        update_tar(TarFile, Release, ExtraFiles, TarHooks, OutputDir, TempDir, State)
     catch
         ?WITH_STACKTRACE(Type, Exception, Stacktrace)
         ?log_debug("exception updating tarball ~p:~p stacktrace=~p",
@@ -161,12 +156,11 @@ update_tar(TarFile, Release, ExtraFiles, OutputDir, State) ->
 
 %% used to add additional files to the release tarball when using systools
 %% before the `extra_files' feature was added to `make_tar'
-update_tar(TarFile, Release, ExtraFiles, OutputDir, TempDir, State) ->
+update_tar(TarFile, Release, ExtraFiles, TarHooks, OutputDir, TempDir, State) ->
     Name = rlx_release:name(Release),
     ErtsVersion = rlx_release:erts(Release),
     ?log_debug("updating tarball ~s with extra files ~p", [TarFile, ExtraFiles]),
     IncludeErts = rlx_state:include_erts(State),
-    TarHooks = rlx_state:tar_hooks(State),
     file:rename(filename:join(OutputDir, [Name, ".tar.gz"]), TarFile),
     erl_tar:extract(TarFile, [{cwd, TempDir}, compressed]),
     maybe_run_hooks(TarHooks, TarFile, TempDir, Release, OutputDir, State),
